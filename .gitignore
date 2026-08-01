@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Environments
+.venv/
+
+# Caches
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+
+# Model / HF caches
+.cache/
+*.safetensors
+*.bin
