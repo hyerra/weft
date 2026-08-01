@@ -6,6 +6,13 @@ readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
     "accelerate>=1.14.0",
+    "matplotlib>=3.11.1",
+    "numpy>=2.5.1",
     "torch>=2.13.0",
     "transformers>=5.14.1",
+]
+
+[dependency-groups]
+dev = [
+    "ipykernel>=7.3.0",
 ]
