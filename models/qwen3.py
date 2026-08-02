@@ -6,8 +6,9 @@ from layers.rope import rope
 
 
 class Qwen3Attention(nn.Module):
-    def __init__(self, hidden_size, head_dim, num_attention_heads, num_key_value_heads, bias, rope_theta, rms_norm_eps):
+    def __init__(self, layer_idx, hidden_size, head_dim, num_attention_heads, num_key_value_heads, bias, rope_theta, rms_norm_eps):
         super().__init__()
+        self.layer_idx = layer_idx
         self.head_dim = head_dim
         self.num_heads_per_group = num_attention_heads // num_key_value_heads
         self.rope_theta = rope_theta
@@ -18,34 +19,37 @@ class Qwen3Attention(nn.Module):
         self.q_norm = nn.RMSNorm((head_dim), eps=rms_norm_eps)
         self.k_norm = nn.RMSNorm((head_dim), eps=rms_norm_eps)
 
-    def forward(self, hidden_states, attention_mask=None):
-        # In: (batch, seq_len, hidden_size)
-        # Out: (batch, seq_len, hidden_size)
+    def forward(self, hidden_states, attention_mask=None, past_key_values=None):
+        # In: (batch, new_seq_len, hidden_size)
+        # Out: (batch, new_seq_len, hidden_size)
         input_shape = hidden_states.shape[:-1]
 
-        # (batch, seq_len, num_heads, head_dim)
+        # (batch, new_seq_len, num_heads, head_dim)
         hidden_shape = (*input_shape, -1, self.head_dim)
 
-        # (batch, num_heads, seq_len, head_dim)
+        # (batch, num_heads, new_seq_len, head_dim)
         q = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-        k = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
-        v = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        k_new = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+        v_new = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
-        q, k = rope(q, self.head_dim, base=1/self.rope_theta), rope(k, self.head_dim, base=1/self.rope_theta)
+        k, v = past_key_values.update(self.layer_idx, k_new, v_new) if past_key_values is not None else (k_new, v_new)
+
+        rope_offset = past_key_values.length if past_key_values is not None else 0
+        q, k = rope(q, self.head_dim, base=1/self.rope_theta, offset=rope_offset), rope(k, self.head_dim, base=1/self.rope_theta)
 
         k = k.repeat_interleave(self.num_heads_per_group, dim=1)
         v = v.repeat_interleave(self.num_heads_per_group, dim=1)
 
-        # (batch, num_heads, seq_len, seq_len)
+        # (batch, num_heads, new_seq_len, seq_len)
         scores = q @ k.transpose(-2, -1) / self.head_dim**0.5
         if attention_mask is not None:
             scores = scores + attention_mask
         attn = torch.softmax(scores, dim=-1)
 
-        # (batch, num_heads, seq_len, head_dim)
+        # (batch, num_heads, new_seq_len, head_dim)
         attn_output = attn @ v
 
-        # (batch, seq_len, hidden_size)
+        # (batch, new_seq_len, hidden_size)
         out = self.o_proj(attn_output.transpose(1, 2).reshape(*input_shape, -1))
         return out
 
@@ -63,15 +67,15 @@ class Qwen3MLP(nn.Module):
 
 
 class Qwen3DecoderBlock(nn.Module):
-    def __init__(self, hidden_size, head_dim, num_attention_heads, num_key_value_heads, intermediate_size, attention_bias, rope_theta, rms_norm_eps):
+    def __init__(self, layer_idx, hidden_size, head_dim, num_attention_heads, num_key_value_heads, intermediate_size, attention_bias, rope_theta, rms_norm_eps):
         super().__init__()
         self.input_layernorm = nn.RMSNorm((hidden_size), eps=rms_norm_eps)
-        self.self_attn = Qwen3Attention(hidden_size, head_dim, num_attention_heads, num_key_value_heads, attention_bias, rope_theta, rms_norm_eps)
+        self.self_attn = Qwen3Attention(layer_idx, hidden_size, head_dim, num_attention_heads, num_key_value_heads, attention_bias, rope_theta, rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm((hidden_size), eps=rms_norm_eps)
         self.mlp = Qwen3MLP(hidden_size, intermediate_size)
 
-    def forward(self, x, attention_mask=None):
-        x = x + self.self_attn(self.input_layernorm(x), attention_mask=attention_mask)
+    def forward(self, x, attention_mask=None, past_key_values=None):
+        x = x + self.self_attn(self.input_layernorm(x), attention_mask=attention_mask, past_key_values=past_key_values)
         x = x + self.mlp(self.post_attention_layernorm(x))
         return x
 
@@ -80,20 +84,24 @@ class Qwen3Model(nn.Module):
     def __init__(self, vocab_size, pad_token_id, hidden_size, head_dim, num_attention_heads, num_key_value_heads, intermediate_size, num_hidden_layers, attention_bias, rope_theta, rms_norm_eps):
         super().__init__()
         self.embed_tokens = nn.Embedding(vocab_size, hidden_size, padding_idx=pad_token_id)
-        self.layers = nn.ModuleList([Qwen3DecoderBlock(hidden_size, head_dim, num_attention_heads, num_key_value_heads, intermediate_size, attention_bias, rope_theta, rms_norm_eps) for _ in range(num_hidden_layers)])
+        self.layers = nn.ModuleList([Qwen3DecoderBlock(layer_idx, hidden_size, head_dim, num_attention_heads, num_key_value_heads, intermediate_size, attention_bias, rope_theta, rms_norm_eps) for layer_idx in range(num_hidden_layers)])
         self.norm = nn.RMSNorm((hidden_size), eps=rms_norm_eps)
 
-    def forward(self, x, attention_mask=None):
-        # In: (batch, seq_len)
-        # Out: (batch, seq_len, hidden_size)
+    def forward(self, x, attention_mask=None, past_key_values=None):
+        # In: (batch, new_seq_len)
+        # Out: (batch, new_seq_len, hidden_size)
         x = self.embed_tokens(x)
-        seq_len = x.shape[-2]
-        causal_mask = torch.ones((seq_len, seq_len), dtype=torch.bool, device=x.device).tril().unsqueeze(0)
-        # (batch, heads (broadcasted), seq_len, seq_len)
+        new_seq_len = x.shape[-2]
+        cache_len = past_key_values.length if past_key_values is not None else 0
+        seq_len = new_seq_len + cache_len
+        causal_mask = torch.ones((new_seq_len, seq_len), dtype=torch.bool, device=x.device).tril(diagonal=cache_len).unsqueeze(0)
+        # (batch, heads (broadcasted), new_seq_len, seq_len)
         mask = (attention_mask[:, None, :].bool() & causal_mask if attention_mask is not None else causal_mask).unsqueeze(1)
         mask = torch.zeros_like(mask, dtype=x.dtype).masked_fill(~mask.bool(), torch.finfo(x.dtype).min)
         for l in self.layers:
-            x = l(x, attention_mask=mask)
+            x = l(x, attention_mask=mask, past_key_values=past_key_values)
+        if past_key_values:
+            past_key_values.advance(new_seq_len)
         x = self.norm(x)
         return x
 
@@ -115,15 +123,18 @@ class Qwen3(nn.Module):
         model.load_state_dict(hf.state_dict(), strict=False)
         return model
 
-    def forward(self, x, attention_mask=None):
-        # In: (batch, seq_len)
-        # Out: (batch, seq_len, vocab_size)
-        x = self.model(x, attention_mask=attention_mask)
+    def forward(self, x, attention_mask=None, past_key_values=None):
+        # In: (batch, new_seq_len)
+        # Out: (batch, new_seq_len, vocab_size)
+        x = self.model(x, attention_mask=attention_mask, past_key_values=past_key_values)
         x = self.lm_head(x)
         return x
 
 
 if __name__ == "__main__":
+    from transformers import AutoTokenizer
+    from cache import KVCache
+
     DTYPE = torch.float32
     config = AutoConfig.from_pretrained("Qwen/Qwen3-0.6B")
     print(config)
@@ -135,3 +146,21 @@ if __name__ == "__main__":
     mine = Qwen3.from_config(config, DTYPE)
     missing, unexpected = mine.load_state_dict(hf.state_dict(), strict=False)
     print("missing:", missing); print("unexpected:", unexpected)
+
+    tok = AutoTokenizer.from_pretrained("Qwen/Qwen3-0.6B")
+    ids = tok("The capital of France is", return_tensors="pt").input_ids
+    with torch.no_grad():
+        l_mine = mine(ids)
+        l_hf = hf(ids).logits
+    assert torch.allclose(l_mine, l_hf, atol=1e-1, rtol=1e-2)
+
+    p = next(mine.parameters())
+    cache = KVCache(config.num_hidden_layers, config.num_key_value_heads, config.max_position_embeddings, config.head_dim, device=p.device, dtype=p.dtype)
+    seq_len = ids.shape[-1]
+    n_prefill = seq_len - 2
+    with torch.no_grad():
+        mine(ids[:, :n_prefill], past_key_values=cache)
+        for t in range(n_prefill, seq_len):
+            l_step = mine(ids[:, t:t + 1], past_key_values=cache)
+            diff = (l_step[:, -1] - l_mine[:, t]).abs().max().item()
+            assert torch.allclose(l_step[:, -1], l_mine[:, t], atol=1e-1, rtol=1e-2), f"cache mismatch at t={t}"
