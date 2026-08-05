@@ -19,7 +19,7 @@ class Qwen3Attention(nn.Module):
         self.q_norm = nn.RMSNorm((head_dim), eps=rms_norm_eps)
         self.k_norm = nn.RMSNorm((head_dim), eps=rms_norm_eps)
 
-    def forward(self, hidden_states, attention_mask=None, past_key_values=None):
+    def forward(self, hidden_states, attention_mask=None, position_ids=None, past_key_values=None):
         # In: (batch, new_seq_len, hidden_size)
         # Out: (batch, new_seq_len, hidden_size)
         input_shape = hidden_states.shape[:-1]
@@ -32,10 +32,9 @@ class Qwen3Attention(nn.Module):
         k_new = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
         v_new = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
-        k, v = past_key_values.update(self.layer_idx, k_new, v_new) if past_key_values is not None else (k_new, v_new)
+        q, k_new = rope(q, self.head_dim, base=1/self.rope_theta, position_ids=position_ids), rope(k_new, self.head_dim, base=1/self.rope_theta, position_ids=position_ids)
 
-        rope_offset = past_key_values.length if past_key_values is not None else 0
-        q, k = rope(q, self.head_dim, base=1/self.rope_theta, offset=rope_offset), rope(k, self.head_dim, base=1/self.rope_theta)
+        k, v = past_key_values.update(self.layer_idx, k_new, v_new) if past_key_values is not None else (k_new, v_new)
 
         k = k.repeat_interleave(self.num_heads_per_group, dim=1)
         v = v.repeat_interleave(self.num_heads_per_group, dim=1)
@@ -74,8 +73,8 @@ class Qwen3DecoderBlock(nn.Module):
         self.post_attention_layernorm = nn.RMSNorm((hidden_size), eps=rms_norm_eps)
         self.mlp = Qwen3MLP(hidden_size, intermediate_size)
 
-    def forward(self, x, attention_mask=None, past_key_values=None):
-        x = x + self.self_attn(self.input_layernorm(x), attention_mask=attention_mask, past_key_values=past_key_values)
+    def forward(self, x, attention_mask=None, position_ids=None, past_key_values=None):
+        x = x + self.self_attn(self.input_layernorm(x), attention_mask=attention_mask, position_ids=position_ids, past_key_values=past_key_values)
         x = x + self.mlp(self.post_attention_layernorm(x))
         return x
 
@@ -87,21 +86,23 @@ class Qwen3Model(nn.Module):
         self.layers = nn.ModuleList([Qwen3DecoderBlock(layer_idx, hidden_size, head_dim, num_attention_heads, num_key_value_heads, intermediate_size, attention_bias, rope_theta, rms_norm_eps) for layer_idx in range(num_hidden_layers)])
         self.norm = nn.RMSNorm((hidden_size), eps=rms_norm_eps)
 
-    def forward(self, x, attention_mask=None, past_key_values=None):
+    def forward(self, x, attention_mask=None, position_ids=None, past_key_values=None):
         # In: (batch, new_seq_len)
         # Out: (batch, new_seq_len, hidden_size)
         x = self.embed_tokens(x)
         new_seq_len = x.shape[-2]
         cache_len = past_key_values.length if past_key_values is not None else 0
         seq_len = new_seq_len + cache_len
+
+        if position_ids is None:
+            position_ids = torch.arange(cache_len, seq_len, device=x.device).unsqueeze(0).expand(x.shape[0], -1)
+
         causal_mask = torch.ones((new_seq_len, seq_len), dtype=torch.bool, device=x.device).tril(diagonal=cache_len).unsqueeze(0)
         # (batch, heads (broadcasted), new_seq_len, seq_len)
         mask = (attention_mask[:, None, :].bool() & causal_mask if attention_mask is not None else causal_mask).unsqueeze(1)
         mask = torch.zeros_like(mask, dtype=x.dtype).masked_fill(~mask.bool(), torch.finfo(x.dtype).min)
         for l in self.layers:
-            x = l(x, attention_mask=mask, past_key_values=past_key_values)
-        if past_key_values:
-            past_key_values.advance(new_seq_len)
+            x = l(x, attention_mask=mask, position_ids=position_ids, past_key_values=past_key_values)
         x = self.norm(x)
         return x
 
@@ -123,10 +124,10 @@ class Qwen3(nn.Module):
         model.load_state_dict(hf.state_dict(), strict=False)
         return model
 
-    def forward(self, x, attention_mask=None, past_key_values=None):
+    def forward(self, x, attention_mask=None, position_ids=None, past_key_values=None):
         # In: (batch, new_seq_len)
         # Out: (batch, new_seq_len, vocab_size)
-        x = self.model(x, attention_mask=attention_mask, past_key_values=past_key_values)
+        x = self.model(x, attention_mask=attention_mask, position_ids=position_ids, past_key_values=past_key_values)
         x = self.lm_head(x)
         return x
 
