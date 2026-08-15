@@ -9,7 +9,8 @@ def generate(model, input_ids, attn_mask, new_tokens, use_cache=True):
     cache = KVCache.for_model(model, B, prompt_tokens + new_tokens) if use_cache else None
 
     for _ in range(new_tokens):
-        logits = model(input_ids, attention_mask=attn_mask, past_key_values=cache)
+        position_ids = (attn_mask.cumsum(-1) - 1).clamp(min=0)[:, -input_ids.shape[-1]:]
+        logits = model(input_ids, attention_mask=attn_mask, position_ids=position_ids, past_key_values=cache)
         next_id = logits[:, -1, :].argmax(-1, keepdim=True)
 
         # Cached, the keys/values for the prefix are already stored, so only the new
