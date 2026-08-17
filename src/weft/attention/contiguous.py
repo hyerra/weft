@@ -7,7 +7,8 @@ from weft.attention.base import AttentionBackend
 
 @dataclass
 class ContiguousMetadata:
-    n_computed_tokens: int
+    cursor: int
+    seq_len: torch.Tensor
 
 
 class ContiguousBackend(AttentionBackend):
@@ -22,18 +23,31 @@ class ContiguousBackend(AttentionBackend):
         return (batch_size, num_kv_heads, max_seq_len, head_dim)
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, metadata: ContiguousMetadata) -> torch.Tensor:
-        # q -> (batch, num_heads, new_seq_len, head_dim)
-        # k,v -> # (batch, num_key_value_heads, new_seq_len, head_dim)
+        # q -> (B, H_q, T, D)
+        # k,v -> # (B, H_kv, T, D)
+        D = self.head_dim
         T = k.shape[-2]
-        start = metadata.n_computed_tokens
-        end = start + T
-        k_cache[..., start:end, :] = k
-        v_cache[..., start:end, :] = v
-        # (batch, num_heads, seq_len, head_dim)
-        num_heads_per_group = self.num_heads // self.num_key_value_heads
-        k_full, v_full = k_cache[..., :end, :].repeat_interleave(num_heads_per_group, dim=1), v_cache[..., :end, :].repeat_interleave(num_heads_per_group, dim=1)
-        # (batch, num_heads, new_seq_len, seq_len)
-        scores = q @ k_full.transpose(-2, -1) / self.head_dim**0.5
-        scores += torch.full((T, end), float('-inf'), device=scores.device, dtype=scores.dtype).triu(diagonal=start+1)
+        C = metadata.cursor
+        S_max = C + T
+        k_cache[..., C:S_max, :] = k
+        v_cache[..., C:S_max, :] = v
+        # (B, H_kv, 1, S_max, D)
+        H_kv = self.num_key_value_heads
+        H_g = self.num_heads // self.num_key_value_heads
+        k_full, v_full = k_cache[..., :S_max, :].unsqueeze(2), v_cache[..., :S_max, :].unsqueeze(2)
+        # (B, H_kv, H_g, T, D)
+        q = q.reshape(-1, H_kv, H_g, T, D)
+        # (B, H_kv, H_g, T, S_max)
+        scores = q @ k_full.transpose(-2, -1) / D**0.5
+        causal_mask = torch.full((T, S_max), torch.finfo(scores.dtype).min, device=scores.device, dtype=scores.dtype).triu(diagonal=C+1)
+        pad_mask = torch.stack([
+            torch.cat([
+                torch.full((T, S_max - n), torch.finfo(scores.dtype).min, device=scores.device, dtype=scores.dtype),
+                torch.zeros((T, n), device=scores.device, dtype=scores.dtype),
+            ], dim=1)
+            for n in metadata.seq_len.tolist()
+        ]).unsqueeze(1).unsqueeze(1)
+        scores += causal_mask + pad_mask
         attn = scores.softmax(dim=-1)
-        return attn @ v_full
+        # (B, H_q, T, D)
+        return (attn @ v_full).flatten(1, 2)
