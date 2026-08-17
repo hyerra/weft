@@ -36,7 +36,6 @@ disagree about layout, because each is what its kernel wants:
 ## Architecture
 
 - `attention/` — backends: layout plus the kernels that read it. Stateless (immutable config only), model-agnostic, no allocation.
-- `cache/` — the block pool: integer ids, free list, refcounts. No tensors.
 - `inference/` — runners own the slab, allocation, and per-step metadata;
   `generate` owns sampling and the feedback loop.
 - `models/` — Qwen3, which delegates all attention to whichever backend the runner
