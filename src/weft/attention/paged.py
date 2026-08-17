@@ -51,13 +51,12 @@ class PagedGatherBackend(AttentionBackend):
             # (H_kv, H_g, T, S)
             scores = q_b @ k_full.transpose(-2, -1) / D**0.5
             causal_mask = torch.full((T_b[b], S[b]), float('-inf'), device=scores.device, dtype=scores.dtype) \
-                .triu(diagonal=n_computed_tokens[b]+1) \
-                .unsqueeze(0)
+                .triu(diagonal=n_computed_tokens[b]+1)
             scores += causal_mask
             attn = scores.softmax(dim=-1)
             # (H_q, T, D)
             out = (attn @ v_full).flatten(0, 1)
             out_parts.append(out)
 
-        # (1, H_q, T, D)
+        # (1, H_q, T_total, D)
         return torch.cat(out_parts, dim=1).unsqueeze(0)

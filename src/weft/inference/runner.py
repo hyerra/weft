@@ -7,7 +7,7 @@ import torch
 from weft.attention.base import AttentionBackend, StepContext
 from weft.attention.contiguous import ContiguousMetadata
 from weft.attention.paged import PagedMetadata
-from weft.cache.state import RequestState
+from weft.inference.state import RequestState
 
 
 class Runner(Protocol):
