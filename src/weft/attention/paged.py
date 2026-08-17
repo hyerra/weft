@@ -10,6 +10,7 @@ class PagedMetadata:
     n_computed_tokens: torch.Tensor # [B]
     slot_mapping: torch.Tensor # [T_total]
     block_table: torch.Tensor # [B, max_blocks]
+    cu_tokens: torch.Tensor # [B+1]
 
 
 class PagedGatherBackend(AttentionBackend):
@@ -24,8 +25,8 @@ class PagedGatherBackend(AttentionBackend):
         return (num_blocks, block_size, num_key_value_heads, head_dim)
 
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, metadata: PagedMetadata) -> torch.Tensor:
-        # q -> (batch, num_heads, new_seq_len, head_dim)
-        # k,v -> # (batch, num_key_value_heads, new_seq_len, head_dim)
+        # q -> (1, H_q, T_total, D)
+        # k,v -> # (1, H_kv, T_total, D)
         N = k_cache.shape[-4]
         P = k_cache.shape[-3]
         H_kv = k_cache.shape[-2]
@@ -34,16 +35,29 @@ class PagedGatherBackend(AttentionBackend):
         k_flat[metadata.slot_mapping] = k.permute(0, 2, 1, 3).reshape(-1, H_kv, D)
         v_flat = v_cache.view(N * P, H_kv, D)
         v_flat[metadata.slot_mapping] = v.permute(0, 2, 1, 3).reshape(-1, H_kv, D)
-        T = k.shape[-2]
-        end = metadata.n_computed_tokens + T
-        max_end = int(end.max())
-        # (batch, num_heads, max_end, head_dim)
-        num_heads_per_group = self.num_heads // self.num_key_value_heads
-        k_full = k_cache[metadata.block_table].flatten(1, 2)[:, :max_end].transpose(1, 2).repeat_interleave(num_heads_per_group, dim=1)
-        v_full = v_cache[metadata.block_table].flatten(1, 2)[:, :max_end].transpose(1, 2).repeat_interleave(num_heads_per_group, dim=1)
-        # (batch, num_heads, new_seq_len, max_end)
-        scores = q @ k_full.transpose(-2, -1) / self.head_dim**0.5
-        scores += torch.stack([torch.full((T, max_end), float('-inf'), device=scores.device, dtype=scores.dtype).triu(diagonal=s+1) for s in metadata.n_computed_tokens.tolist()]).unsqueeze(1)
-        attn = scores.softmax(dim=-1)
-        # (batch, num_heads, new_seq_len, head_dim)
-        return attn @ v_full
+        T_b = (metadata.cu_tokens[1:] - metadata.cu_tokens[:-1])
+        S = (metadata.n_computed_tokens + T_b).tolist()
+        T_b = T_b.tolist()
+        cu_tokens = metadata.cu_tokens.tolist()
+        H_g = self.num_heads // self.num_key_value_heads
+        n_computed_tokens = metadata.n_computed_tokens.tolist()
+        out_parts = []
+        for b in range(metadata.block_table.shape[0]):
+            # (H_kv, 1, S, D)
+            k_full = k_cache[metadata.block_table[b]].flatten(0, 1)[:S[b]].transpose(0, 1).unsqueeze(1)
+            v_full = v_cache[metadata.block_table[b]].flatten(0, 1)[:S[b]].transpose(0, 1).unsqueeze(1)
+            # (H_kv, H_g, T, D)
+            q_b = q[0, :, cu_tokens[b]:cu_tokens[b+1], :].reshape(H_kv, H_g, -1, D)
+            # (H_kv, H_g, T, S)
+            scores = q_b @ k_full.transpose(-2, -1) / D**0.5
+            causal_mask = torch.full((T_b[b], S[b]), float('-inf'), device=scores.device, dtype=scores.dtype) \
+                .triu(diagonal=n_computed_tokens[b]+1) \
+                .unsqueeze(0)
+            scores += causal_mask
+            attn = scores.softmax(dim=-1)
+            # (H_q, T, D)
+            out = (attn @ v_full).flatten(0, 1)
+            out_parts.append(out)
+
+        # (1, H_q, T, D)
+        return torch.cat(out_parts, dim=1).unsqueeze(0)
