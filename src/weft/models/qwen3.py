@@ -1,3 +1,9 @@
+"""Qwen3, with attention delegated to whichever backend the runner supplies.
+
+Shapes follow weft.attention.base: B requests, T new tokens per request, E hidden
+size, H_q / H_kv heads, D head dimension.
+"""
+
 import torch
 from torch import nn
 from transformers import AutoConfig, AutoModelForCausalLM
@@ -21,15 +27,16 @@ class Qwen3Attention(nn.Module):
         self.k_norm = nn.RMSNorm((config.head_dim), eps=config.rms_norm_eps)
 
     def forward(self, hidden_states, context: StepContext, position_ids: torch.Tensor):
-        # In: (batch, new_seq_len, hidden_size)
-        # Out: (batch, new_seq_len, hidden_size)
+        # In: (B, T, E)
+        # Out: (B, T, E)
         input_shape = hidden_states.shape[:-1]
 
-        # (batch, new_seq_len, num_heads, head_dim)
+        # (B, T, H_q, D)
         hidden_shape = (*input_shape, -1, self.head_dim)
 
-        # (batch, num_heads, new_seq_len, head_dim)
+        # (B, H_q, T, D)
         q = self.q_norm(self.q_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
+        # (B, H_kv, T, D)
         k_new = self.k_norm(self.k_proj(hidden_states).view(hidden_shape)).transpose(1, 2)
         v_new = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
 
@@ -37,7 +44,7 @@ class Qwen3Attention(nn.Module):
 
         attn_output = context.backend.forward(q, k_new, v_new, context.k_view[self.layer_idx], context.v_view[self.layer_idx], context.metadata)
 
-        # (batch, new_seq_len, hidden_size)
+        # (B, T, E)
         out = self.o_proj(attn_output.transpose(1, 2).reshape(*input_shape, -1))
         return out
 
@@ -76,8 +83,8 @@ class Qwen3Model(nn.Module):
         self.norm = nn.RMSNorm((config.hidden_size), eps=config.rms_norm_eps)
 
     def forward(self, x, context: StepContext, position_ids: torch.Tensor):
-        # In: (batch, new_seq_len)
-        # Out: (batch, new_seq_len, hidden_size)
+        # In: (B, T)
+        # Out: (B, T, E)
         x = self.embed_tokens(x)
         for l in self.layers:
             x = l(x, context, position_ids=position_ids)
@@ -104,8 +111,8 @@ class Qwen3(nn.Module):
         return model
 
     def forward(self, x, context: StepContext, position_ids: torch.Tensor):
-        # In: (batch, new_seq_len)
-        # Out: (batch, new_seq_len, vocab_size)
+        # In: (B, T)
+        # Out: (B, T, V)
         x = self.model(x, context, position_ids=position_ids)
         x = self.lm_head(x)
         return x
