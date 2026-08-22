@@ -1,21 +1,21 @@
-from typing import Iterator
-
 import torch
 
-from weft.inference.runner import Runner
+from weft.inference.engine import Engine
+
 
 @torch.inference_mode()
-def generate(runner: Runner, prompts: list[torch.Tensor], max_new_tokens: int) -> Iterator[torch.Tensor]:
-    request_ids = list(range(len(prompts)))
-    next_input = prompts
-    for i in range(len(prompts)):
-        runner.add_request(i)
-
-    for _ in range(max_new_tokens):
-        logits = runner.step(request_ids, next_input)
-        next_tok = logits.argmax(-1, keepdim=True)
-        next_input = list(next_tok.unbind(dim=0))
-        yield next_tok
-
-    for i in range(len(prompts)):
-        runner.finish_request(i)
+def generate(engine: Engine, prompts: list[torch.Tensor], arrivals: list[int] | None = None) -> list[list[int]]:
+    arrivals = arrivals or [0] * len(prompts)
+    ids: dict[int, int] = {}  # prompt index -> request id
+    outputs: dict[int, list[int]] = {}
+    tick = 0
+    while len(ids) < len(prompts) or engine.has_unfinished():
+        for i, arrival in enumerate(arrivals):
+            if arrival == tick:
+                ids[i] = engine.add_request(prompts[i])
+                outputs[ids[i]] = []
+        for out in engine.step():
+            if out.token is not None:
+                outputs[out.request_id].append(out.token)
+        tick += 1
+    return [outputs[ids[i]] for i in range(len(prompts))]

@@ -6,8 +6,10 @@ from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
 from weft.attention.contiguous import ContiguousBackend
 from weft.attention.paged import PagedGatherBackend
+from weft.inference.engine import Engine
 from weft.inference.generate import generate
 from weft.inference.runner import ContiguousRunner, PagedRunner
+from weft.inference.scheduler import BlockManager, ContinuousScheduler, StaticScheduler
 from weft.models.qwen3 import Qwen3
 
 MODEL_ID = "Qwen/Qwen3-0.6B"
@@ -16,7 +18,6 @@ BLOCK_SIZE = 8
 DTYPE = torch.float32
 DEVICE = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 
-# Deliberately different lengths — ragged is the point now.
 MESSAGES = [
     "Hi.",
     "What is 2 + 2?",
@@ -52,9 +53,9 @@ def tokenize(tok, msgs):
 
 
 @torch.inference_mode()
-def run_mine(make_runner, prompts, max_new_tokens):
-    runner = make_runner(len(prompts), max(p.shape[0] for p in prompts) + max_new_tokens)
-    return torch.cat(list(generate(runner, prompts, max_new_tokens)), dim=1)  # [B, N]
+def run_mine(make_engine, prompts, max_new_tokens, arrivals=None):
+    engine = make_engine(len(prompts), max(p.shape[0] for p in prompts) + max_new_tokens, max_new_tokens)
+    return generate(engine, prompts, arrivals)  # list[list[int]], EOS-terminated
 
 
 @torch.inference_mode()
@@ -71,33 +72,39 @@ def run_hf(hf, tok, msgs, max_new_tokens, force_full_length=False):
     return out[:, batch["input_ids"].shape[1]:]
 
 
-def check(tok, hf_out, eos_ids, make_runner, prompts, msgs, label):
-    my_out = run_mine(make_runner, prompts, MAX_NEW_TOKENS)
+def check(tok, hf_out, eos_ids, make_engine, prompts, msgs, label, arrivals=None):
+    my_out = run_mine(make_engine, prompts, MAX_NEW_TOKENS, arrivals)
 
     ok = True
     for b, msg in enumerate(msgs):
-        hf_row, my_row = hf_out[b].tolist(), my_out[b].tolist()
-        # Compare ids up to and including HF's EOS.
+        hf_row, my_row = hf_out[b].tolist(), my_out[b]
+        # Our stack stops at EOS now, like HF: rows should match exactly,
+        # length included, once HF's post-EOS padding is stripped.
         stop = next((i + 1 for i, t in enumerate(hf_row) if t in eos_ids), len(hf_row))
-        hf_row, my_row = hf_row[:stop], my_row[:stop]
+        hf_row = hf_row[:stop]
         if hf_row != my_row:
             ok = False
-            div = next(i for i, (a, c) in enumerate(zip(hf_row, my_row)) if a != c)
+            div = next(
+                (i for i, (a, c) in enumerate(zip(hf_row, my_row)) if a != c),
+                min(len(hf_row), len(my_row)),  # lengths differ, contents agree
+            )
             print(
-                f"[FAIL] {label} | {msg[:32]!r}: diverges at generated token {div}: "
-                f"hf={hf_row[div]} mine={my_row[div]}\n"
+                f"[FAIL] {label} | {msg[:32]!r}: diverges at generated token {div} "
+                f"(hf len {len(hf_row)}, mine len {len(my_row)})\n"
                 f"       hf:   {tok.decode(hf_row[:div + 3])!r}\n"
                 f"       mine: {tok.decode(my_row[:div + 3])!r}"
             )
         else:
-            print(f"[OK]   {label} | {msg[:32]!r}: {stop} tokens identical")
+            print(f"[OK]   {label} | {msg[:32]!r}: {len(my_row)} tokens identical")
     return ok
 
 
-def bench(tok, hf, make_runner, prompts, msgs, label):
-    for name, fn in [
-        ("hf", lambda n: run_hf(hf, tok, msgs, n, force_full_length=True)),
-        (label, lambda n: run_mine(make_runner, prompts, n)),
+def bench(tok, hf, make_engine, prompts, msgs, label):
+    for name, fn, count in [
+        ("hf", lambda n: run_hf(hf, tok, msgs, n, force_full_length=True),
+         lambda out: out.shape[0] * out.shape[1]),
+        (label, lambda n: run_mine(make_engine, prompts, n),
+         lambda out: sum(len(r) for r in out)),
     ]:
         fn(8)  # warmup
         sync()
@@ -105,8 +112,8 @@ def bench(tok, hf, make_runner, prompts, msgs, label):
         out = fn(MAX_NEW_TOKENS)
         sync()
         dt = time.perf_counter() - t0
-        n_tokens = out.shape[0] * out.shape[1]
-        print(f"{name:>12}: {dt:6.2f}s  {n_tokens / dt:8.1f} tok/s  ({out.shape[0]}x{out.shape[1]} tokens)")
+        n_tokens = count(out)
+        print(f"{name:>12}: {dt:6.2f}s  {n_tokens / dt:8.1f} tok/s  ({n_tokens} tokens)")
 
 
 def main():
@@ -115,29 +122,42 @@ def main():
     prompts = tokenize(tok, MESSAGES)
     print(f"{len(prompts)} ragged prompts, lengths: {[p.shape[0] for p in prompts]}")
 
-    def make_contiguous(batch_size, max_seq_len):
-        backend = ContiguousBackend(config.num_attention_heads, config.num_key_value_heads, config.head_dim)
-        return ContiguousRunner(mine, backend, batch_size=batch_size, max_seq_len=max_seq_len)
-
-    def make_paged(batch_size, max_seq_len):
-        backend = PagedGatherBackend(config.num_attention_heads, config.num_key_value_heads, config.head_dim)
-        # One sequence's worth of blocks per row, plus slack for partial blocks.
-        num_blocks = batch_size * (math.ceil(max_seq_len / BLOCK_SIZE) + 1)
-        return PagedRunner(mine, backend, num_blocks=num_blocks, block_size=BLOCK_SIZE)
-
-    runners = [
-        ("contiguous", make_contiguous),
-        ("paged", make_paged)
-    ]
-
-    print("\n--- correctness: token-exact vs HF generate (ragged batch) ---")
-    hf_out = run_hf(hf, tok, MESSAGES, MAX_NEW_TOKENS)
     eos = hf.generation_config.eos_token_id
     eos_ids = set(eos) if isinstance(eos, list) else {eos}
-    passed = [(label, f) for label, f in runners if check(tok, hf_out, eos_ids, f, prompts, MESSAGES, label)]
+
+    def make_contiguous_engine(batch_size, max_seq_len, max_tokens):
+        # Rows are blocks with P = max_seq_len: one block per request.
+        manager = BlockManager(num_blocks=batch_size, block_size=max_seq_len)
+        backend = ContiguousBackend(config.num_attention_heads, config.num_key_value_heads, config.head_dim)
+        runner = ContiguousRunner(mine, backend, batch_size=manager.num_blocks, max_seq_len=manager.block_size)
+        scheduler = StaticScheduler(manager, max_seqs=batch_size,
+                                    max_tokens=batch_size * max_seq_len)
+        return Engine(runner, scheduler, eos_ids, max_tokens)
+
+    def make_paged_engine(batch_size, max_seq_len, max_tokens):
+        num_blocks = batch_size * (math.ceil(max_seq_len / BLOCK_SIZE) + 1)
+        manager = BlockManager(num_blocks=num_blocks, block_size=BLOCK_SIZE)
+        backend = PagedGatherBackend(config.num_attention_heads, config.num_key_value_heads, config.head_dim)
+        runner = PagedRunner(mine, backend, num_blocks=manager.num_blocks, block_size=manager.block_size)
+        scheduler = ContinuousScheduler(manager, max_seqs=batch_size,
+                                        max_tokens=batch_size * max_seq_len)
+        return Engine(runner, scheduler, eos_ids, max_tokens)
+
+    engines = [
+        ("contiguous", make_contiguous_engine),
+        ("paged", make_paged_engine),
+    ]
+
+    print("\n--- correctness: token-exact vs HF generate (ragged batch, engine) ---")
+    hf_out = run_hf(hf, tok, MESSAGES, MAX_NEW_TOKENS)
+    passed = [(label, f) for label, f in engines if check(tok, hf_out, eos_ids, f, prompts, MESSAGES, label)]
+
+    # Continuous batching verification: the last request is admitted mid-generation
+    check(tok, hf_out, eos_ids, make_paged_engine, prompts, MESSAGES, "paged+midflight",
+          arrivals=[0, 0, 10])
 
     if not passed:
-        print("\nno runner passed — benchmarking a wrong implementation is meaningless, stopping.")
+        print("\nno engine passed — benchmarking a wrong implementation is meaningless, stopping.")
         return
 
     print("\n--- benchmark: greedy decode ---")
