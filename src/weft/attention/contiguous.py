@@ -9,6 +9,7 @@ from weft.attention.base import AttentionBackend
 class ContiguousMetadata:
     cursor: int
     seq_len: torch.Tensor
+    rows: list[int]
 
 
 class ContiguousBackend(AttentionBackend):
@@ -29,12 +30,12 @@ class ContiguousBackend(AttentionBackend):
         T = k.shape[-2]
         C = metadata.cursor
         S_max = C + T
-        k_cache[..., C:S_max, :] = k
-        v_cache[..., C:S_max, :] = v
+        k_cache[metadata.rows, :, C:S_max, :] = k
+        v_cache[metadata.rows, :, C:S_max, :] = v
         # (B, H_kv, 1, S_max, D)
         H_kv = self.num_key_value_heads
         H_g = self.num_heads // self.num_key_value_heads
-        k_full, v_full = k_cache[..., :S_max, :].unsqueeze(2), v_cache[..., :S_max, :].unsqueeze(2)
+        k_full, v_full = k_cache[metadata.rows, :, :S_max, :].unsqueeze(2), v_cache[metadata.rows, :, :S_max, :].unsqueeze(2)
         # (B, H_kv, H_g, T, D)
         q = q.reshape(-1, H_kv, H_g, T, D)
         # (B, H_kv, H_g, T, S_max)
