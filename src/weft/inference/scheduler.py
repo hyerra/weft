@@ -9,6 +9,7 @@ from weft.inference.runner import ScheduledRequest
 
 class BlockManager:
     def __init__(self, num_blocks: int, block_size: int):
+        assert block_size > 0 & (block_size - 1) == 0, "block_size must be a power of 2"
         self._num_blocks = num_blocks
         self.block_size = block_size
         self._free_blocks = deque(range(num_blocks))

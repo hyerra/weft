@@ -24,9 +24,7 @@ class PagedGatherBackend(AttentionBackend):
     def kv_cache_shape(num_blocks: int, block_size: int, num_key_value_heads: int, head_dim: int) -> tuple[int, int, int, int]:
         return (num_blocks, block_size, num_key_value_heads, head_dim)
 
-    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, metadata: PagedMetadata) -> torch.Tensor:
-        # q -> (1, H_q, T_total, D)
-        # k,v -> # (1, H_kv, T_total, D)
+    def _store(self, k: torch.Tensor, v: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, metadata: PagedMetadata):
         N = k_cache.shape[-4]
         P = k_cache.shape[-3]
         H_kv = k_cache.shape[-2]
@@ -35,6 +33,13 @@ class PagedGatherBackend(AttentionBackend):
         k_flat[metadata.slot_mapping] = k.permute(0, 2, 1, 3).reshape(-1, H_kv, D)
         v_flat = v_cache.view(N * P, H_kv, D)
         v_flat[metadata.slot_mapping] = v.permute(0, 2, 1, 3).reshape(-1, H_kv, D)
+
+    def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, metadata: PagedMetadata) -> torch.Tensor:
+        # q -> (1, H_q, T_total, D)
+        # k,v -> # (1, H_kv, T_total, D)
+        H_kv = k_cache.shape[-2]
+        D = k_cache.shape[-1]
+        self._store(k, v, k_cache, v_cache, metadata)
         T_b = (metadata.cu_tokens[1:] - metadata.cu_tokens[:-1])
         S = (metadata.n_computed_tokens + T_b).tolist()
         T_b = T_b.tolist()

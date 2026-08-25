@@ -1,6 +1,9 @@
+import argparse
+import functools
 import math
 import time
 
+import modal
 import torch
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
@@ -13,7 +16,7 @@ from weft.inference.scheduler import BlockManager, ContinuousScheduler, StaticSc
 from weft.models.qwen3 import Qwen3
 
 MODEL_ID = "Qwen/Qwen3-0.6B"
-MAX_NEW_TOKENS = 100
+MAX_NEW_TOKENS = 500
 BLOCK_SIZE = 8
 DTYPE = torch.float32
 DEVICE = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
@@ -23,6 +26,9 @@ MESSAGES = [
     "What is 2 + 2?",
     "Tell me a joke about a cat who is learning to play the piano.",
 ]
+
+modal_app = modal.App("weft-gpu")
+modal_image = modal.Image.debian_slim().uv_sync().add_local_python_source("weft")
 
 
 def sync():
@@ -103,7 +109,7 @@ def bench(tok, hf, make_engine, prompts, msgs, label):
     for name, fn, count in [
         ("hf", lambda n: run_hf(hf, tok, msgs, n, force_full_length=True),
          lambda out: out.shape[0] * out.shape[1]),
-        (label, lambda n: run_mine(make_engine, prompts, n),
+        (label, lambda n: run_mine(functools.partial(make_engine, ignore_eos=True), prompts, n),
          lambda out: sum(len(r) for r in out)),
     ]:
         fn(8)  # warmup
@@ -116,7 +122,7 @@ def bench(tok, hf, make_engine, prompts, msgs, label):
         print(f"{name:>12}: {dt:6.2f}s  {n_tokens / dt:8.1f} tok/s  ({n_tokens} tokens)")
 
 
-def main():
+def run_local():
     print(f"device={DEVICE} dtype={DTYPE}")
     tok, config, hf, mine = load()
     prompts = tokenize(tok, MESSAGES)
@@ -125,28 +131,34 @@ def main():
     eos = hf.generation_config.eos_token_id
     eos_ids = set(eos) if isinstance(eos, list) else {eos}
 
-    def make_contiguous_engine(batch_size, max_seq_len, max_tokens):
+    def make_contiguous_engine(batch_size, max_seq_len, max_tokens, ignore_eos=False):
         # Rows are blocks with P = max_seq_len: one block per request.
         manager = BlockManager(num_blocks=batch_size, block_size=max_seq_len)
         backend = ContiguousBackend(config.num_attention_heads, config.num_key_value_heads, config.head_dim)
         runner = ContiguousRunner(mine, backend, batch_size=manager.num_blocks, max_seq_len=manager.block_size)
         scheduler = StaticScheduler(manager, max_seqs=batch_size,
                                     max_tokens=batch_size * max_seq_len)
-        return Engine(runner, scheduler, eos_ids, max_tokens)
+        return Engine(runner, scheduler, set() if ignore_eos else eos_ids, max_tokens)
 
-    def make_paged_engine(batch_size, max_seq_len, max_tokens):
+    def make_paged_engine(batch_size, max_seq_len, max_tokens, backend_cls=PagedGatherBackend, ignore_eos=False):
         num_blocks = batch_size * (math.ceil(max_seq_len / BLOCK_SIZE) + 1)
         manager = BlockManager(num_blocks=num_blocks, block_size=BLOCK_SIZE)
-        backend = PagedGatherBackend(config.num_attention_heads, config.num_key_value_heads, config.head_dim)
+        backend = backend_cls(config.num_attention_heads, config.num_key_value_heads, config.head_dim)
         runner = PagedRunner(mine, backend, num_blocks=manager.num_blocks, block_size=manager.block_size)
         scheduler = ContinuousScheduler(manager, max_seqs=batch_size,
                                         max_tokens=batch_size * max_seq_len)
-        return Engine(runner, scheduler, eos_ids, max_tokens)
+        return Engine(runner, scheduler, set() if ignore_eos else eos_ids, max_tokens)
+
+    def make_triton_engine(batch_size, max_seq_len, max_tokens, ignore_eos=False):
+        from weft.attention.paged_triton import PagedTritonBackend
+        return make_paged_engine(batch_size, max_seq_len, max_tokens, backend_cls=PagedTritonBackend, ignore_eos=ignore_eos)
 
     engines = [
         ("contiguous", make_contiguous_engine),
         ("paged", make_paged_engine),
     ]
+    if torch.cuda.is_available():
+        engines.append(("triton", make_triton_engine))
 
     print("\n--- correctness: token-exact vs HF generate (ragged batch, engine) ---")
     hf_out = run_hf(hf, tok, MESSAGES, MAX_NEW_TOKENS)
@@ -163,6 +175,28 @@ def main():
     print("\n--- benchmark: greedy decode ---")
     for label, factory in passed:
         bench(tok, hf, factory, prompts, MESSAGES, label)
+
+
+@modal_app.function(
+    image=modal_image,
+    gpu="A10G",
+    timeout=1800,
+    volumes={"/root/.cache/huggingface": modal.Volume.from_name("weft-hf-cache", create_if_missing=True)},
+)
+def run_remote():
+    run_local()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="weft correctness check + benchmark")
+    parser.add_argument("--modal", action="store_true", help="run on a Modal GPU instead of locally")
+    args = parser.parse_args()
+
+    if args.modal:
+        with modal.enable_output(), modal_app.run():
+            run_remote.remote()
+    else:
+        run_local()
 
 
 if __name__ == "__main__":

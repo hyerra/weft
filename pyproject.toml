@@ -13,6 +13,7 @@ dependencies = [
     "numpy>=2.5.1",
     "torch>=2.13.0",
     "transformers>=5.14.1",
+    "triton>=3.7.1 ; sys_platform == 'linux'",
 ]
 
 [project.scripts]
@@ -25,4 +26,5 @@ build-backend = "uv_build"
 [dependency-groups]
 dev = [
     "ipykernel>=7.3.0",
+    "modal>=1.5.4",
 ]
