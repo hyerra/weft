@@ -67,6 +67,7 @@ class SchedulingBudget:
 class SchedulerOutput:
     scheduled: list[ScheduledRequest]
     failed: list[Request]
+    preempted: list[tuple[int, int]]  # (request_id, cached tokens lost at eviction)
 
 
 def _add(request: Request, max_tokens: int, waiting: deque[Request]) -> None:
@@ -88,7 +89,8 @@ def _fail_if_infeasible(req: Request, block_manager: BlockManager, running: list
     req.status = RequestStatus.FAILED
     return True
 
-def _preempt(victim: Request, block_manager: BlockManager, running: list[Request], waiting: deque[Request]) -> None:
+def _preempt(victim: Request, block_manager: BlockManager, running: list[Request], waiting: deque[Request], preempted: list[tuple[int, int]]) -> None:
+    preempted.append((victim.id, victim.num_computed_tokens))
     block_manager.free(victim.id)
     victim.status = RequestStatus.WAITING
     victim.num_computed_tokens = 0
@@ -118,7 +120,7 @@ def _admit_waiting(budget: SchedulingBudget, waiting: deque[Request], running: l
         req.status = RequestStatus.RUNNING
 
 
-def _schedule_running(running: list[Request], waiting: deque[Request], budget: SchedulingBudget, block_manager: BlockManager, scheduled: list[ScheduledRequest], failed: list[Request]) -> None:
+def _schedule_running(running: list[Request], waiting: deque[Request], budget: SchedulingBudget, block_manager: BlockManager, scheduled: list[ScheduledRequest], failed: list[Request], preempted: list[tuple[int, int]]) -> None:
     for req in list(running):
         if _fail_if_infeasible(req, block_manager, running, waiting):
             failed.append(req)
@@ -126,7 +128,7 @@ def _schedule_running(running: list[Request], waiting: deque[Request], budget: S
             continue
         while not block_manager.can_allocate(req.id, req.num_tokens):
             victim = running[-1]
-            _preempt(victim, block_manager, running, waiting)
+            _preempt(victim, block_manager, running, waiting, preempted)
             if victim is req:
                 # No emit can follow because freeing our own blocks
                 # raises blocks needed by exactly what it frees.
@@ -148,6 +150,9 @@ def _finish(request: Request, block_manager: BlockManager, running: list[Request
 
 
 class Scheduler(Protocol):
+    total_preemptions: int
+    total_recomputed_tokens: int
+
     def add(self, request: Request) -> None: ...
     def schedule(self) -> SchedulerOutput: ...
     def finish(self, request: Request) -> None: ...
@@ -155,6 +160,8 @@ class Scheduler(Protocol):
 
 class StaticScheduler(Scheduler):
     def __init__(self, block_manager: BlockManager, max_seqs: int, max_tokens: int):
+        self.total_preemptions = 0
+        self.total_recomputed_tokens = 0
         self._block_manager = block_manager
         self._max_seqs = max_seqs
         self._max_tokens = max_tokens
@@ -167,15 +174,18 @@ class StaticScheduler(Scheduler):
     def schedule(self) -> SchedulerOutput:
         scheduled: list[ScheduledRequest] = []
         failed: list[Request] = []
+        preempted: list[tuple[int, int]] = []
 
         budget = SchedulingBudget(self._max_seqs, self._max_tokens)
         # Create a new batch of requests
         if not self._running:
             _admit_waiting(budget, self._waiting, self._running, self._block_manager, scheduled, failed)
-            return SchedulerOutput(scheduled, failed)
+            return SchedulerOutput(scheduled, failed, preempted)
         # Otherwise, only handle in-flight requests
-        _schedule_running(self._running, self._waiting, budget, self._block_manager, scheduled, failed)
-        return SchedulerOutput(scheduled, failed)
+        _schedule_running(self._running, self._waiting, budget, self._block_manager, scheduled, failed, preempted)
+        self.total_preemptions += len(preempted)
+        self.total_recomputed_tokens += sum(t for _, t in preempted)
+        return SchedulerOutput(scheduled, failed, preempted)
 
     def finish(self, request: Request) -> None:
         _finish(request, self._block_manager, self._running, self._waiting)
@@ -183,6 +193,8 @@ class StaticScheduler(Scheduler):
 
 class ContinuousScheduler(Scheduler):
     def __init__(self, block_manager: BlockManager, max_seqs: int, max_tokens: int):
+        self.total_preemptions = 0
+        self.total_recomputed_tokens = 0
         self._block_manager = block_manager
         self._max_seqs = max_seqs
         self._max_tokens = max_tokens
@@ -195,12 +207,15 @@ class ContinuousScheduler(Scheduler):
     def schedule(self) -> SchedulerOutput:
         scheduled: list[ScheduledRequest] = []
         failed: list[Request] = []
+        preempted: list[tuple[int, int]] = []
 
         budget = SchedulingBudget(self._max_seqs, self._max_tokens)
 
-        _schedule_running(self._running, self._waiting, budget, self._block_manager, scheduled, failed)
+        _schedule_running(self._running, self._waiting, budget, self._block_manager, scheduled, failed, preempted)
         _admit_waiting(budget, self._waiting, self._running, self._block_manager, scheduled, failed)
-        return SchedulerOutput(scheduled, failed)
+        self.total_preemptions += len(preempted)
+        self.total_recomputed_tokens += sum(t for _, t in preempted)
+        return SchedulerOutput(scheduled, failed, preempted)
 
     def finish(self, request: Request) -> None:
         _finish(request, self._block_manager, self._running, self._waiting)

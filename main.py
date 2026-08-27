@@ -1,23 +1,18 @@
 import argparse
 import functools
-import math
+import json
+import subprocess
 import time
+from pathlib import Path
 
 import modal
 import torch
-from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
 
-from weft.attention.contiguous import ContiguousBackend
-from weft.attention.paged import PagedGatherBackend
-from weft.inference.engine import Engine
+from weft.benchmark.factories import blocks_for, load_model, make_contiguous_engine, make_paged_engine, make_triton_engine
 from weft.inference.generate import generate
-from weft.inference.runner import ContiguousRunner, PagedRunner
-from weft.inference.scheduler import BlockManager, ContinuousScheduler, StaticScheduler
-from weft.models.qwen3 import Qwen3
 
 MODEL_ID = "Qwen/Qwen3-0.6B"
 MAX_NEW_TOKENS = 500
-BLOCK_SIZE = 8
 DTYPE = torch.float32
 DEVICE = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
 
@@ -28,23 +23,10 @@ MESSAGES = [
 ]
 
 modal_app = modal.App("weft-gpu")
-modal_image = modal.Image.debian_slim().uv_sync().add_local_python_source("weft")
-
-
-def sync():
-    if DEVICE == "cuda":
-        torch.cuda.synchronize()
-    elif DEVICE == "mps":
-        torch.mps.synchronize()
-
-
-def load():
-    tok = AutoTokenizer.from_pretrained(MODEL_ID, padding_side="left")
-    config = AutoConfig.from_pretrained(MODEL_ID)
-    hf = AutoModelForCausalLM.from_pretrained(MODEL_ID, dtype=DTYPE).to(DEVICE).eval()
-    mine = Qwen3.from_config(config, DTYPE)
-    mine.load_state_dict(hf.state_dict(), strict=False)
-    return tok, config, hf, mine.to(DEVICE)
+modal_image = (modal.Image.debian_slim().uv_sync()
+               .env({"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"})
+               .add_local_python_source("weft"))
+hf_cache = modal.Volume.from_name("weft-hf-cache", create_if_missing=True)
 
 
 def tokenize(tok, msgs):
@@ -65,16 +47,13 @@ def run_mine(make_engine, prompts, max_new_tokens, arrivals=None):
 
 
 @torch.inference_mode()
-def run_hf(hf, tok, msgs, max_new_tokens, force_full_length=False):
+def run_hf(hf, tok, msgs, max_new_tokens):
     batch = tok.apply_chat_template(
         [[{"role": "user", "content": m}] for m in msgs],
         add_generation_prompt=True, tokenize=True, return_dict=True,
         padding=True, return_tensors="pt",
     ).to(DEVICE)
-    kwargs = dict(do_sample=False, num_beams=1, max_new_tokens=max_new_tokens)
-    if force_full_length:
-        kwargs["min_new_tokens"] = max_new_tokens
-    out = hf.generate(**batch, **kwargs)
+    out = hf.generate(**batch, do_sample=False, num_beams=1, max_new_tokens=max_new_tokens)
     return out[:, batch["input_ids"].shape[1]:]
 
 
@@ -84,8 +63,6 @@ def check(tok, hf_out, eos_ids, make_engine, prompts, msgs, label, arrivals=None
     ok = True
     for b, msg in enumerate(msgs):
         hf_row, my_row = hf_out[b].tolist(), my_out[b]
-        # Our stack stops at EOS now, like HF: rows should match exactly,
-        # length included, once HF's post-EOS padding is stripped.
         stop = next((i + 1 for i, t in enumerate(hf_row) if t in eos_ids), len(hf_row))
         hf_row = hf_row[:stop]
         if hf_row != my_row:
@@ -105,98 +82,79 @@ def check(tok, hf_out, eos_ids, make_engine, prompts, msgs, label, arrivals=None
     return ok
 
 
-def bench(tok, hf, make_engine, prompts, msgs, label):
-    for name, fn, count in [
-        ("hf", lambda n: run_hf(hf, tok, msgs, n, force_full_length=True),
-         lambda out: out.shape[0] * out.shape[1]),
-        (label, lambda n: run_mine(functools.partial(make_engine, ignore_eos=True), prompts, n),
-         lambda out: sum(len(r) for r in out)),
-    ]:
-        fn(8)  # warmup
-        sync()
-        t0 = time.perf_counter()
-        out = fn(MAX_NEW_TOKENS)
-        sync()
-        dt = time.perf_counter() - t0
-        n_tokens = count(out)
-        print(f"{name:>12}: {dt:6.2f}s  {n_tokens / dt:8.1f} tok/s  ({n_tokens} tokens)")
-
-
-def run_local():
+def run_gate():
     print(f"device={DEVICE} dtype={DTYPE}")
-    tok, config, hf, mine = load()
+    tok, hf, mine, eos_ids = load_model(MODEL_ID, DTYPE, DEVICE)
     prompts = tokenize(tok, MESSAGES)
     print(f"{len(prompts)} ragged prompts, lengths: {[p.shape[0] for p in prompts]}")
 
-    eos = hf.generation_config.eos_token_id
-    eos_ids = set(eos) if isinstance(eos, list) else {eos}
+    def paged(n, s, t, **kw):
+        return make_paged_engine(mine, eos_ids, blocks_for(n, s), t, **kw)
 
-    def make_contiguous_engine(batch_size, max_seq_len, max_tokens, ignore_eos=False):
-        # Rows are blocks with P = max_seq_len: one block per request.
-        manager = BlockManager(num_blocks=batch_size, block_size=max_seq_len)
-        backend = ContiguousBackend(config.num_attention_heads, config.num_key_value_heads, config.head_dim)
-        runner = ContiguousRunner(mine, backend, batch_size=manager.num_blocks, max_seq_len=manager.block_size)
-        scheduler = StaticScheduler(manager, max_seqs=batch_size,
-                                    max_tokens=batch_size * max_seq_len)
-        return Engine(runner, scheduler, set() if ignore_eos else eos_ids, max_tokens)
-
-    def make_paged_engine(batch_size, max_seq_len, max_tokens, backend_cls=PagedGatherBackend, ignore_eos=False):
-        num_blocks = batch_size * (math.ceil(max_seq_len / BLOCK_SIZE) + 1)
-        manager = BlockManager(num_blocks=num_blocks, block_size=BLOCK_SIZE)
-        backend = backend_cls(config.num_attention_heads, config.num_key_value_heads, config.head_dim)
-        runner = PagedRunner(mine, backend, num_blocks=manager.num_blocks, block_size=manager.block_size)
-        scheduler = ContinuousScheduler(manager, max_seqs=batch_size,
-                                        max_tokens=batch_size * max_seq_len)
-        return Engine(runner, scheduler, set() if ignore_eos else eos_ids, max_tokens)
-
-    def make_triton_engine(batch_size, max_seq_len, max_tokens, ignore_eos=False):
-        from weft.attention.paged_triton import PagedTritonBackend
-        return make_paged_engine(batch_size, max_seq_len, max_tokens, backend_cls=PagedTritonBackend, ignore_eos=ignore_eos)
+    def triton(n, s, t, **kw):
+        return make_triton_engine(mine, eos_ids, blocks_for(n, s), t, **kw)
 
     engines = [
-        ("contiguous", make_contiguous_engine),
-        ("paged", make_paged_engine),
+        ("contiguous", functools.partial(make_contiguous_engine, mine, eos_ids)),
+        ("paged", paged),
     ]
     if torch.cuda.is_available():
-        engines.append(("triton", make_triton_engine))
+        engines.append(("triton", triton))
 
     print("\n--- correctness: token-exact vs HF generate (ragged batch, engine) ---")
     hf_out = run_hf(hf, tok, MESSAGES, MAX_NEW_TOKENS)
-    passed = [(label, f) for label, f in engines if check(tok, hf_out, eos_ids, f, prompts, MESSAGES, label)]
+    ok = all([check(tok, hf_out, eos_ids, f, prompts, MESSAGES, label) for label, f in engines])
 
-    # Continuous batching verification: the last request is admitted mid-generation
-    check(tok, hf_out, eos_ids, make_paged_engine, prompts, MESSAGES, "paged+midflight",
-          arrivals=[0, 0, 10])
-
-    if not passed:
-        print("\nno engine passed — benchmarking a wrong implementation is meaningless, stopping.")
-        return
-
-    print("\n--- benchmark: greedy decode ---")
-    for label, factory in passed:
-        bench(tok, hf, factory, prompts, MESSAGES, label)
+    # Continuous batching verification: the last request is admitted mid-generation,
+    ok &= check(tok, hf_out, eos_ids, paged, prompts, MESSAGES, "paged+midflight",
+                arrivals=[0, 0, 10])
+    return ok
 
 
 @modal_app.function(
-    image=modal_image,
-    gpu="A10G",
-    timeout=1800,
-    volumes={"/root/.cache/huggingface": modal.Volume.from_name("weft-hf-cache", create_if_missing=True)},
+    image=modal_image, gpu="A10G", timeout=1800,
+    volumes={"/root/.cache/huggingface": hf_cache},
 )
-def run_remote():
-    run_local()
+def gate_remote():
+    return run_gate()
+
+
+@modal_app.function(
+    image=modal_image, gpu="L40S", timeout=5400,
+    volumes={"/root/.cache/huggingface": hf_cache},
+)
+def collect_remote(names: list[str]) -> dict:
+    from weft.benchmark.experiments import collect
+
+    return collect(names)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="weft correctness check + benchmark")
-    parser.add_argument("--modal", action="store_true", help="run on a Modal GPU instead of locally")
+    parser = argparse.ArgumentParser(description="weft correctness check + experiment collection")
+    from weft.benchmark.experiments import EXPERIMENTS
+
+    parser.add_argument("--modal", action="store_true", help="run the gate on a Modal GPU")
+    parser.add_argument("--collect", nargs="+", metavar="EXP", choices=[*EXPERIMENTS, "all"],
+                        help="run experiments on Modal and write results/*.json (e.g. --collect e1 e3, or all)")
     args = parser.parse_args()
 
-    if args.modal:
+    if args.collect:
+        names = list(EXPERIMENTS) if "all" in args.collect else args.collect
         with modal.enable_output(), modal_app.run():
-            run_remote.remote()
+            results = collect_remote.remote(names)
+        stamp = time.strftime("%Y%m%d")
+        sha = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
+                             capture_output=True, text=True).stdout.strip()
+        for stem, payload in results.items():
+            payload["meta"]["git_sha"] = sha
+            path = Path("results") / f"{stem}_{stamp}.json"
+            path.write_text(json.dumps(payload, indent=1))
+            print(f"wrote {path}")
+    elif args.modal:
+        with modal.enable_output(), modal_app.run():
+            gate_remote.remote()
     else:
-        run_local()
+        run_gate()
 
 
 if __name__ == "__main__":

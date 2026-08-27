@@ -18,8 +18,8 @@ class Engine:
     def __init__(self, runner: Runner, scheduler: Scheduler, eos_ids: set[int], max_tokens: int):
         self._requests: dict[int, Request] = {}
         self._next_id = 0
-        self._runner = runner
-        self._scheduler = scheduler
+        self.runner = runner
+        self.scheduler = scheduler
         self._eos_ids = eos_ids
         self._max_tokens = max_tokens
 
@@ -28,12 +28,12 @@ class Engine:
         self._next_id += 1
         req = Request(id, prompt, [], RequestStatus.WAITING, 0)
         self._requests[id] = req
-        self._scheduler.add(req)
+        self.scheduler.add(req)
         return id
 
     def step(self) -> list[RequestOutput]:
         out: list[RequestOutput] = []
-        requests = self._scheduler.schedule()
+        requests = self.scheduler.schedule()
         for failed in requests.failed:
             req = self._requests[failed.id]
             req.finish_reason = failed.finish_reason
@@ -45,7 +45,7 @@ class Engine:
             )
         if not requests.scheduled:
             return out
-        toks = self._runner.step(requests.scheduled).argmax(dim=-1)
+        toks = self.runner.step(requests.scheduled).argmax(dim=-1)
         for scheduled, tok in zip(requests.scheduled, toks.tolist()):
             req = self._requests[scheduled.request_id]
             status = RequestStatus.RUNNING
@@ -58,7 +58,7 @@ class Engine:
                 finish_reason = FinishReason.MAX_TOKENS
             req.finish_reason = finish_reason
             if req.finish_reason is not None:
-                self._scheduler.finish(req)
+                self.scheduler.finish(req)
                 del self._requests[req.id]
             out.append(
                 RequestOutput(scheduled.request_id, tok, req.finish_reason)
