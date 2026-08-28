@@ -1,0 +1,53 @@
+{
+ "block_sizes": [
+  8,
+  16,
+  32,
+  64,
+  128,
+  256
+ ],
+ "batch_size": 8,
+ "seq_len_per_req": 384,
+ "runs": [
+  {
+   "block_size": 8,
+   "waste_pct": 0.0,
+   "output_tps": 248.8157964495232
+  },
+  {
+   "block_size": 16,
+   "waste_pct": 0.0,
+   "output_tps": 249.92728793901608
+  },
+  {
+   "block_size": 32,
+   "waste_pct": 0.0,
+   "output_tps": 251.6799447675885
+  },
+  {
+   "block_size": 64,
+   "waste_pct": 0.0,
+   "output_tps": 250.22882662556265
+  },
+  {
+   "block_size": 128,
+   "waste_pct": 0.0,
+   "output_tps": 248.69818340866868
+  },
+  {
+   "block_size": 256,
+   "waste_pct": 33.333333333333336,
+   "output_tps": 209.9685166398581
+  }
+ ],
+ "meta": {
+  "experiment": "e6",
+  "model": "Qwen/Qwen3-0.6B",
+  "dtype": "torch.bfloat16",
+  "device": "cuda",
+  "gpu": "NVIDIA L40S",
+  "timestamp": "2026-08-28T01:43:43",
+  "git_sha": "b8c713e"
+ }
+}
