@@ -64,8 +64,14 @@ The cache layout depends on the attention backend:
 You can find detailed visualizations around the performance of weft in the `analysis.ipynb` notebook.
 
 Some important results include:
-1. The p50 TTFT drops (64 requests, mixed length) drops from 10s -> 1.5s when switching from static scheduling and contiguous attention to the continuous scheduling with triton kernel.
+1. The p50 TTFT (64 requests, mixed length) drops from 10s -> 1.5s when switching from static scheduling and contiguous attention to the continuous scheduling with triton kernel.
 2. The same 64 request workload finishes in 12 seconds vs 28 seconds when comparing continuous_triton vs static_contiguous.
 3. The triton kernel scales much better than any of the other attention backends.
 4. Triton kernel ITL p50 is 36ms vs 47ms contiguous vs 59 ms paged-gather.
 5. The throughput degrades gracefully as we reduce the pool size.
+
+![TTFT under Poisson arrivals](artifacts/charts/e4_ttft.png)
+
+![Decode inter-token latency percentiles by backend](artifacts/charts/e1_itl_bands.png)
+
+![GPU time per decode tick by op](artifacts/charts/e7_profile.png)
